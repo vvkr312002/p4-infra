@@ -1,0 +1,118 @@
+name: CI → Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  NODE_VERSION: "20"
+
+jobs:
+  # ── 1. Test ──────────────────────────────────────────────────────────────────
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+
+      - name: Install dependencies (backend)
+        working-directory: ./backend
+        run: npm ci
+
+      - name: Install dependencies (frontend)
+        working-directory: ./frontend
+        run: npm ci
+
+      - name: Run backend tests
+        working-directory: ./backend
+        run: npm test
+        env:
+          NODE_ENV: test
+          # Use throw-away vars for tests — never hit production RDS
+          DB_HOST: localhost
+          DB_NAME: securechat_test
+          DB_USER: testuser
+          DB_PASS: testpass
+          JWT_SECRET: ci-test-secret-do-not-use-in-prod
+          PORT: "3000"
+
+      - name: Run crypto module tests (P2)
+        working-directory: ./frontend
+        run: npm test -- --watchAll=false
+
+  # ── 2. Deploy (main branch only) ─────────────────────────────────────────────
+  deploy:
+    name: Deploy to EC2
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+
+      - name: Add EC2 to known_hosts
+        run: |
+          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Deploy — pull, install, migrate, restart
+        run: |
+          ssh ubuntu@${{ secrets.EC2_HOST }} << 'ENDSSH'
+            set -e
+
+            echo "==> Pulling latest code..."
+            cd /opt/securechat
+            git pull origin main
+
+            echo "==> Loading secrets from SSM..."
+            source /opt/securechat/scripts/load-env.sh
+
+            echo "==> Installing backend dependencies..."
+            cd /opt/securechat/backend
+            npm ci --omit=dev
+
+            echo "==> Installing frontend dependencies and building..."
+            cd /opt/securechat/frontend
+            npm ci
+            npm run build
+
+            echo "==> Running DB migrations..."
+            cd /opt/securechat
+            mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" < migrations/001_create_users.sql
+            mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" < migrations/002_create_messages.sql
+            mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" < migrations/003_create_audit_log.sql
+
+            echo "==> Restarting application via PM2..."
+            pm2 restart securechat-backend --update-env || pm2 start ecosystem.config.js
+            pm2 save
+
+            echo "==> Deploy complete."
+          ENDSSH
+
+      - name: Notify team on failure
+        if: failure()
+        run: |
+          echo "::error::Deploy to EC2 failed. Check the SSH step above for details."
+          # Add Slack/email notification here if desired
+
+# ── Required GitHub Secrets ────────────────────────────────────────────────────
+# EC2_HOST            — Elastic IP of your EC2 instance
+# EC2_SSH_PRIVATE_KEY — Private key matching the key pair attached to EC2
+#
+# These are read from AWS SSM on the EC2 instance at runtime (not stored in GH):
+# DB_HOST, DB_NAME, DB_USER, DB_PASS, JWT_SECRET, KMS_KEY_ID, NODE_ENV, PORT
